@@ -136,7 +136,12 @@ def update_window_bitmap(hwnd, rgba_image):
     # premultiply alpha (required for AC_SRC_ALPHA blending)
     arr[:, :, :3] *= (arr[:, :, 3:4] / 255.0)
     arr = arr.astype(np.uint8)
-    # BMP is bottom-up
+    # 32-bit Windows DIBs pack pixels as BGRA (blue-green-red-alpha) in memory,
+    # but PIL/numpy gives us RGBA. Swap the R and B channels or every colour
+    # shows with red/blue flipped (e.g. red -> blue, yellow -> cyan). This was
+    # the "urgency colour looks blue" bug.
+    arr = arr[:, :, [2, 1, 0, 3]]
+    # BMP rows are bottom-up
     arr = arr[::-1]
     buf = arr.tobytes()
 

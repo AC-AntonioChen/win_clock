@@ -43,7 +43,7 @@ from ctypes import wintypes
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageTk
 import numpy as np
 import tkinter as tk
-from tkinter import simpledialog, messagebox
+from tkinter import ttk, simpledialog, messagebox
 
 # --------------------------------------------------------------------------- #
 # Win32 plumbing for UpdateLayeredWindow (per-pixel alpha)
@@ -207,13 +207,14 @@ DEFAULT_TARGETS = [
 DEFAULT_THEME = "night"   # defined early so DEFAULT_SETTINGS can reference it
 DEFAULT_SETTINGS = {"scale": 1.0, "pos_x": None, "pos_y": None, "theme": DEFAULT_THEME}
 
-# Today's key milestones (hour, minute). The user-defined moments that mark
-# the passing of the day — "time is running out" reminders. 24:00 (next midnight)
-# is appended automatically as the "today ends" sentinel.
+# Today's key milestones — each is a TIME SPAN (start->end), not a single
+# moment. Only spans the user is currently inside are shown in the carousel;
+# gaps between spans (e.g. lunch 12:30-14:00) are skipped. Cross-midnight
+# spans are not supported (end must be later than start, same day).
 DEFAULT_MILESTONES = [
-    ("12:30", 12, 30),
-    ("17:30", 17, 30),
-    ("23:00", 23, 0),
+    {"name": "上午工作", "start": "09:00", "end": "12:30"},
+    {"name": "下午工作", "start": "14:00", "end": "17:30"},
+    {"name": "晚上",     "start": "19:00", "end": "23:00"},
 ]
 
 # Carousel timing (seconds each frame stays before scrolling to the next).
@@ -225,7 +226,7 @@ SCROLL_DURATION = 1.2  # animation length of one slide transition (slow & gentle
 # Capsule geometry
 # --------------------------------------------------------------------------- #
 BASE_W = 390   # content needs ~376px; small slack keeps it from auto-growing
-BASE_H = 120
+BASE_H = 128   # extra room at the bottom for the progress bar
 MARGIN = 24  # transparent padding (also room for drop shadow)
 
 
@@ -343,13 +344,25 @@ THEMES = {
 
 
 def load_config():
-    data = {"targets": list(DEFAULT_TARGETS), "settings": dict(DEFAULT_SETTINGS)}
+    data = {"targets": list(DEFAULT_TARGETS),
+            "milestones": [dict(m) for m in DEFAULT_MILESTONES],
+            "settings": dict(DEFAULT_SETTINGS)}
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 raw = json.load(f)
             if isinstance(raw.get("targets"), list):
                 data["targets"] = raw["targets"]
+            # milestones: only accept a list of well-formed span dicts
+            if isinstance(raw.get("milestones"), list):
+                valid = []
+                for m in raw["milestones"]:
+                    if (isinstance(m, dict) and _parse_hhmm(m.get("start"))
+                            and _parse_hhmm(m.get("end"))):
+                        valid.append({"name": str(m.get("name", "节点")),
+                                      "start": m["start"], "end": m["end"]})
+                if valid:
+                    data["milestones"] = valid
             if isinstance(raw.get("settings"), dict):
                 for k in ("scale", "pos_x", "pos_y", "theme"):
                     if k in raw["settings"]:
@@ -445,6 +458,20 @@ def parse_date(s):
     return None
 
 
+def _parse_hhmm(s):
+    """Parse 'HH:MM' -> (hour, minute) or None if malformed."""
+    if not isinstance(s, str) or s.count(":") != 1:
+        return None
+    h, m = s.split(":")
+    try:
+        h, m = int(h), int(m)
+    except ValueError:
+        return None
+    if 0 <= h <= 23 and 0 <= m <= 59:
+        return (h, m)
+    return None
+
+
 def split_remaining(target_date, now=None):
     now = now or dt.datetime.now()
     target_dt = dt.datetime(target_date.year, target_date.month, target_date.day)
@@ -500,53 +527,76 @@ def _tw(draw, text, font):
 class Frame:
     """A single carousel frame.
 
-    left_name   : top-left title text   (e.g. "国庆节" / "今日节点")
-    left_label  : small label below it  (e.g. "剩余" / "下一节点")
+    left_name   : top-left title text   (e.g. "国庆节" / "上午工作")
+    left_label  : small label below it  (e.g. "剩余" / "已过 60%")
     main_text   : the big focal string  (e.g. "67" / "2")
     main_unit   : unit after the big number (e.g. "天" / "时")
     hms         : [hh, mm, ss] right-side secondary readout
-    urgency     : "normal" | "yellow" | "orange" | "red"  -> main_text colour
+    progress    : 0.0..1.0 within the span (None = no progress bar / no urgency)
     """
     __slots__ = ("left_name", "left_label", "main_text", "main_unit",
-                 "hms", "urgency")
+                 "hms", "progress")
 
     def __init__(self, left_name, left_label, main_text, main_unit,
-                 hms, urgency="normal"):
+                 hms, progress=None):
         self.left_name = left_name
         self.left_label = left_label
         self.main_text = main_text
         self.main_unit = main_unit
         self.hms = hms
-        self.urgency = urgency
+        self.progress = progress
 
 
-URGENCY_COLOR = {
-    "normal": (255, 255, 255, 255),   # white
-    "yellow": (255, 214, 70, 255),    # warm yellow
-    "orange": (255, 152, 50, 255),    # orange
-    "red":    (255, 76, 76, 255),     # red — strongest
-}
+# ---- Smooth urgency colour (front-gentle, back-steep) ---------------------- #
+# Colour stops the urgency ramp walks through as progress goes 0 -> 1:
+#   white -> yellow -> orange -> red
+# Defined in RGB; interpolated by urgency_colour() below.
+_URGENCY_STOPS = [
+    (255, 255, 255),   # 0.00  white (plenty of time)
+    (255, 214, 70),    # 0.33  yellow
+    (255, 152, 50),    # 0.66  orange
+    (255, 76, 76),     # 1.00  red (deadline)
+]
 
 
-def urgency_for_seconds(total_seconds):
-    """Map a remaining-time (seconds) to an urgency level.
+def _urgency_curve(progress):
+    """Map raw progress [0,1] to a curved urgency value [0,1].
 
-      > 1h         -> normal (white)
-      30m..1h      -> yellow
-      5m..30m      -> orange
-      < 5m         -> red
+    Front-gentle, back-steep: the first half of the span changes slowly
+    (0 -> 0.25), the second half accelerates (0.25 -> 1.0). This makes a node
+    stay mostly white early on and only start visibly warming up past halfway.
     """
-    if total_seconds is None:
-        return "normal"
-    if total_seconds < 0:
-        return "normal"
-    if total_seconds < 5 * 60:
-        return "red"
-    if total_seconds < 30 * 60:
-        return "orange"
-    if total_seconds < 3600:
-        return "yellow"
-    return "normal"
+    p = max(0.0, min(1.0, progress))
+    if p < 0.5:
+        # gentle linear first half: 0 -> 0.25
+        return p * 0.5
+    # second half: 0.25 -> 1.0 via quadratic (steepens toward the end)
+    v = (p - 0.5) / 0.5
+    return 0.25 + 0.75 * (v * v)
+
+
+def urgency_colour(progress):
+    """Continuous RGBA colour for a given progress (0=start .. 1=deadline).
+
+    Returns pure white when progress is None (e.g. main-target frame).
+    """
+    if progress is None:
+        return (255, 255, 255, 255)
+    t = _urgency_curve(progress)
+    # interpolate across the colour stops
+    if t <= 0:
+        return _URGENCY_STOPS[0] + (255,)
+    if t >= 1:
+        return _URGENCY_STOPS[-1] + (255,)
+    seg = t * (len(_URGENCY_STOPS) - 1)
+    i = int(seg)
+    frac = seg - i
+    a = _URGENCY_STOPS[i]
+    b = _URGENCY_STOPS[i + 1]
+    return (int(a[0] + (b[0] - a[0]) * frac),
+            int(a[1] + (b[1] - a[1]) * frac),
+            int(a[2] + (b[2] - a[2]) * frac),
+            255)
 
 
 # --------------------------------------------------------------------------- #
@@ -574,8 +624,8 @@ def render_capsule(frame, scale=1.0, scroll_offset=0.0, theme=None):
     main_txt = str(frame.main_text)
     unit_txt = frame.main_unit or ""
     hms = list(frame.hms) if frame.hms else ["00", "00", "00"]
-    # normal urgency uses the theme accent; coloured urgency overrides it
-    main_color = URGENCY_COLOR[frame.urgency] if frame.urgency != "normal" else theme.accent
+    # Urgency colour from the frame's progress. None (main target) -> white.
+    num_color = urgency_colour(frame.progress)
 
     f_name = _font(18 * s, bold=True, cjk=_has_cjk(name_txt))
     f_label = _font(14 * s, bold=False, cjk=True)
@@ -596,7 +646,7 @@ def render_capsule(frame, scale=1.0, scroll_offset=0.0, theme=None):
     pad = int(22 * s)
     gap_unit = int(8 * s)
     gap_hms_sep = int(8 * s)
-    group_gap = int(24 * s)
+    group_gap = int(32 * s)   # gap between big number and H:M:S group
 
     days_group_w = d_w + (gap_unit + unit_w if unit_txt else 0)
     hms_group_w = sum(hms_pieces_w) + 2 * sep_w + 2 * gap_hms_sep
@@ -608,8 +658,14 @@ def render_capsule(frame, scale=1.0, scroll_offset=0.0, theme=None):
     img = Image.new("RGBA", (win_w, win_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    x0, y0 = MARGIN, MARGIN
-    x1, y1 = MARGIN + W, MARGIN + H
+    # scroll_offset moves the WHOLE capsule (body + text + bar) up/down as a
+    # unit. The body_mask clip at the end still bounds it, but during a slide
+    # the outgoing and incoming capsules occupy different vertical positions,
+    # so alpha-compositing them no longer double-stacks two bodies on top of
+    # each other (which was causing the muddy/blue overlap).
+    dy_total = int(scroll_offset * (H + 8))
+    x0, y0 = MARGIN, MARGIN + dy_total
+    x1, y1 = MARGIN + W, MARGIN + H + dy_total
     radius = H // 2
 
     # soft drop shadow (skip for fully-transparent themes)
@@ -654,11 +710,8 @@ def render_capsule(frame, scale=1.0, scroll_offset=0.0, theme=None):
             draw.rounded_rectangle((x0, y0, x1 - 1, y1 - 1),
                                    radius=radius, outline=theme.outline, width=1)
 
-    # ---- text, with vertical scroll offset applied ---- #
-    # scroll_offset in [-1,1]: -1 = fully above (slid up out), +1 = fully below.
-    # Map to a pixel shift over the capsule height.
-    dy = int(scroll_offset * (H + 8))
-    mid_y = (y0 + y1) // 2 + dy
+    # ---- text (the whole capsule already shifted by dy_total above) ---- #
+    mid_y = (y0 + y1) // 2
     # Left column: name above label, vertically centred as a block.
     # We space the two lines by a value derived from the font SIZE (not the
     # textbbox height), because CJK font bounding boxes under-report vertical
@@ -675,7 +728,7 @@ def render_capsule(frame, scale=1.0, scroll_offset=0.0, theme=None):
 
     after_left = left_x + max(name_w, label_w) + group_gap
     days_x = after_left
-    draw.text((days_x - d_ox, mid_y - d_h // 2 - 2), main_txt, fill=main_color, font=f_main)
+    draw.text((days_x - d_ox, mid_y - d_h // 2 - 2), main_txt, fill=num_color, font=f_main)
     if unit_txt:
         unit_x = days_x + d_w + gap_unit
         draw.text((unit_x - unit_ox, mid_y - unit_h // 2 + int(14 * s)),
@@ -683,23 +736,42 @@ def render_capsule(frame, scale=1.0, scroll_offset=0.0, theme=None):
 
     hms_right = x1 - pad
     cx = hms_right
-    draw.text((cx - hms_pieces_w[2], mid_y - hms_h // 2 - 4), hms[2], fill=theme.hms, font=f_hms)
+    draw.text((cx - hms_pieces_w[2], mid_y - hms_h // 2 - 4), hms[2], fill=num_color, font=f_hms)
     ss_cx = cx - hms_pieces_w[2] // 2
     cx -= hms_pieces_w[2] + gap_hms_sep + sep_w
     draw.text((cx - sep_w, mid_y - hms_h // 2 - 4), sep, fill=theme.sep, font=f_hms)
     cx -= sep_w + gap_hms_sep
-    draw.text((cx - hms_pieces_w[1], mid_y - hms_h // 2 - 4), hms[1], fill=theme.hms, font=f_hms)
+    draw.text((cx - hms_pieces_w[1], mid_y - hms_h // 2 - 4), hms[1], fill=num_color, font=f_hms)
     mm_cx = cx - hms_pieces_w[1] // 2
     cx -= hms_pieces_w[1] + gap_hms_sep + sep_w
     draw.text((cx - sep_w, mid_y - hms_h // 2 - 4), sep, fill=theme.sep, font=f_hms)
     cx -= sep_w + gap_hms_sep
-    draw.text((cx - hms_pieces_w[0], mid_y - hms_h // 2 - 4), hms[0], fill=theme.hms, font=f_hms)
+    draw.text((cx - hms_pieces_w[0], mid_y - hms_h // 2 - 4), hms[0], fill=num_color, font=f_hms)
     hh_cx = cx - hms_pieces_w[0] // 2
 
     label_y = mid_y - hms_h // 2 - 4 + hms_h + int(4 * s)
     for txt, ccx in (("时", hh_cx), ("分", mm_cx), ("秒", ss_cx)):
         tw, th, tox = _tw(draw, txt, f_tiny)
         draw.text((ccx - tw // 2 - tox, label_y), txt, fill=theme.hms_label, font=f_tiny)
+
+    # ---- bottom progress bar (only for milestone frames with progress) ---- #
+    if frame.progress is not None and has_body:
+        bar_h = max(2, int(4 * s))
+        bar_inset = max(2, int(4 * s))
+        bar_y = y1 - bar_h - bar_inset
+        bar_x0 = x0 + bar_inset
+        bar_x1 = x1 - bar_inset
+        # trough (dark groove)
+        draw.rounded_rectangle((bar_x0, bar_y, bar_x1, bar_y + bar_h),
+                               radius=bar_h // 2,
+                               fill=(0, 0, 0, 90))
+        # fill (urgency-coloured), width = progress * trough width
+        fill_w = int((bar_x1 - bar_x0) * max(0.0, min(1.0, frame.progress)))
+        if fill_w > 1:
+            draw.rounded_rectangle(
+                (bar_x0, bar_y, bar_x0 + fill_w, bar_y + bar_h),
+                radius=bar_h // 2, fill=num_color,
+            )
 
     # clip text to the rounded body so scrolling frames don't leak past edges.
     # For bodyless (clear) themes there's no shape to clip to, so return as-is.
@@ -717,7 +789,7 @@ def nearest_target(config, now=None):
     now = now or dt.datetime.now()
     today = now.date()
     futures, pasts = [], []
-    for t in config["targets"]:
+    for t in config.get("targets", []) or []:
         d = parse_date(t.get("date"))
         if d is None:
             continue
@@ -734,7 +806,7 @@ def nearest_target(config, now=None):
 def tooltip_lines(config, now=None):
     now = now or dt.datetime.now()
     lines = []
-    for t in config["targets"]:
+    for t in config.get("targets", []) or []:
         d = parse_date(t.get("date"))
         if d is None:
             lines.append(f"{t.get('name','?')}: 日期无效")
@@ -748,80 +820,113 @@ def tooltip_lines(config, now=None):
 # --------------------------------------------------------------------------- #
 # Frame construction for the carousel
 # --------------------------------------------------------------------------- #
-def _next_milestone_dt(now, h, m):
-    """datetime of today's h:m if still in the future, else None (passed)."""
-    cand = now.replace(hour=h, minute=m, second=0, microsecond=0)
-    return cand if cand > now else None
+def _span_datetimes(now, start_hhmm, end_hhmm):
+    """Return (start_dt, end_dt) for a span on `now`'s date, or None if the
+    span is malformed / crosses midnight (unsupported)."""
+    sh, sm = start_hhmm
+    eh, em = end_hhmm
+    start_dt = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    end_dt = now.replace(hour=eh, minute=em, second=0, microsecond=0)
+    if end_dt <= start_dt:  # crosses midnight or zero-length — unsupported
+        return None
+    return start_dt, end_dt
 
 
 def build_main_frame(config, now=None):
-    """The focal main-target frame, or None if no targets set."""
+    """The focal main-target frame.
+
+    If the target has a 'start' date, the frame carries a progress value
+    (how far we are between start and target date) so it gets a progress bar
+    + urgency colour too, just like milestone spans.
+    """
     now = now or dt.datetime.now()
     target, target_date = nearest_target(config, now)
     if target is None or target_date is None:
-        return Frame("未设置", "—", "0", "天", ["00", "00", "00"], "normal")
+        return Frame("未设置", "—", "0", "天", ["00", "00", "00"], progress=None)
     days, hh, mm, ss, is_past = split_remaining(target_date, now)
     label = "已过" if is_past else "剩余"
+
+    # progress across [start_date -> target_date]
+    progress = None
+    start_date = parse_date(target.get("start"))
+    if start_date and target_date and target_date > start_date:
+        today = now.date()
+        if today <= start_date:
+            progress = 0.0
+        elif today >= target_date:
+            progress = 1.0
+        else:
+            span = (target_date - start_date).days
+            done = (today - start_date).days
+            progress = max(0.0, min(1.0, done / span)) if span > 0 else None
+        if progress is not None:
+            label = ("剩余" if not is_past else "已过") + f" {int(progress*100)}%"
+
     return Frame(target.get("name", ""), label, str(days), "天",
-                 [f"{hh:02d}", f"{mm:02d}", f"{ss:02d}"], "normal")
+                 [f"{hh:02d}", f"{mm:02d}", f"{ss:02d}"], progress=progress)
 
 
-def build_milestone_frames(now=None):
-    """Frames for each upcoming milestone today, plus the 'day ends' frame.
+def build_milestone_frames(config, now=None):
+    """Frames for each milestone span the user is CURRENTLY inside.
 
-    Only milestones still in the future are returned (per spec: skip passed
-    ones). Each frame's main number is the hours remaining to that milestone,
-    with the finer H:M:S in the secondary readout. Urgency colour is derived
-    from the seconds remaining.
+    Spans not yet started or already ended are skipped (e.g. lunch gap between
+    morning and afternoon work). Returns [] when nothing is active right now.
     """
     now = now or dt.datetime.now()
     frames = []
-    for label, h, m in DEFAULT_MILESTONES:
-        mdt = _next_milestone_dt(now, h, m)
-        if mdt is None:
+    for m in config.get("milestones", []):
+        s = _parse_hhmm(m.get("start"))
+        e = _parse_hhmm(m.get("end"))
+        if not s or not e:
             continue
-        total = int((mdt - now).total_seconds())
-        hh, rem = divmod(total, 3600)
+        sp = _span_datetimes(now, s, e)
+        if sp is None:
+            continue
+        start_dt, end_dt = sp
+        if not (start_dt <= now <= end_dt):
+            continue  # outside this span — skip
+        # progress within span: 0 at start, 1 at end
+        span_total = (end_dt - start_dt).total_seconds()
+        if span_total <= 0:
+            continue
+        elapsed = (now - start_dt).total_seconds()
+        progress = max(0.0, min(1.0, elapsed / span_total))
+        # remaining time to the end
+        remain = max(0, int((end_dt - now).total_seconds()))
+        hh, rem = divmod(remain, 3600)
         mm, ss = divmod(rem, 60)
-        urg = urgency_for_seconds(total)
-        # main focal = whole hours left (or "0" when under 1h); unit "时"
-        # but when under an hour we show minutes as the big number instead,
-        # so the urgency reads more naturally.
-        if total >= 3600:
+        # focal number: hours if >=1h, else minutes (reads more naturally)
+        if remain >= 3600:
             main_txt, unit = str(hh), "时"
         else:
             main_txt, unit = str(mm), "分"
+        pct = int(progress * 100)
         frames.append(Frame(
-            label, "还剩", main_txt, unit,
-            [f"{hh:02d}", f"{mm:02d}", f"{ss:02d}"], urg,
+            m.get("name", "节点"), f"已过 {pct}%",
+            main_txt, unit,
+            [f"{hh:02d}", f"{mm:02d}", f"{ss:02d}"],
+            progress=progress,
         ))
-    # "today ends" sentinel — next midnight.
-    midnight = (now + dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    total = int((midnight - now).total_seconds())
-    hh, rem = divmod(total, 3600)
-    mm, ss = divmod(rem, 60)
-    urg = urgency_for_seconds(total)
-    frames.append(Frame("今天结束", "还剩",
-                        str(hh), "时",
-                        [f"{hh:02d}", f"{mm:02d}", f"{ss:02d}"], urg))
     return frames
 
 
 def build_carousel(config, now=None):
-    """Full ordered carousel list for this moment: [main] + [milestones...].
+    """Full ordered carousel list for this moment: [main] + [active spans...].
 
-    Main target leads; milestones follow in chronological order. If there are
-    no milestones left today (e.g. just before midnight) only main is returned.
+    Main target always leads; active milestone spans follow. If no span is
+    active right now (e.g. lunch break, or outside all working hours), only
+    the main target is shown.
     """
     now = now or dt.datetime.now()
     frames = [build_main_frame(config, now)]
-    frames.extend(build_milestone_frames(now))
+    frames.extend(build_milestone_frames(config, now))
     return frames
 
 
 def dwell_for(frame):
     """How long (seconds) a frame should stay before scrolling to the next."""
-    if frame.left_label in ("剩余", "已过"):
+    # main target frame uses 天 as its unit (milestones use 时/分)
+    if frame.main_unit == "天":
         return DWELL_MAIN
     return DWELL_MILESTONE
 
@@ -1010,7 +1115,16 @@ class FloatingCapsule:
                                         scroll_offset=-eased, theme=theme)
             img_in, W = render_capsule(frames[in_idx], scale=self.scale,
                                        scroll_offset=1 - eased, theme=theme)
-            img = Image.alpha_composite(img_out, img_in)
+            # The two frames may have different widths (content auto-grows the
+            # capsule). Pad both onto a common transparent canvas of the larger
+            # size so alpha_composite won't raise "images do not match".
+            max_w = max(img_out.size[0], img_in.size[0])
+            max_h = max(img_out.size[1], img_in.size[1])
+            canvas_out = Image.new("RGBA", (max_w, max_h), (0, 0, 0, 0))
+            canvas_in = Image.new("RGBA", (max_w, max_h), (0, 0, 0, 0))
+            canvas_out.paste(img_out, (0, 0), img_out)
+            canvas_in.paste(img_in, (0, 0), img_in)
+            img = Image.alpha_composite(canvas_out, canvas_in)
         else:
             frame = self._current_frame()
             # refresh the live numbers on this same item
@@ -1202,6 +1316,7 @@ class FloatingCapsule:
         if self.config["targets"]:
             menu.add_separator()
         menu.add_command(label="添加目标...", command=self.add_target)
+        menu.add_command(label="配置节点...", command=self._open_milestones_editor)
         menu.add_command(label=f"缩放 {int(self.scale*100)}%  (滚轮调节)",
                          state="disabled")
         menu.add_command(label="  放大", command=lambda: self._zoom_to(self.scale + self.SCALE_STEP))
@@ -1262,6 +1377,146 @@ class FloatingCapsule:
             return
         self._set_theme("#" + h.upper())
 
+    # ---- milestone span editor (independent Toplevel window) ---- #
+    def _open_milestones_editor(self):
+        """Open a window to add / edit / delete milestone spans."""
+        win = tk.Toplevel(self.root)
+        win.title("配置今日节点")
+        win.attributes("-topmost", True)
+        win.resizable(True, True)
+        win.grab_set()  # modal
+
+        # working copy — saved to config only on "保存"
+        items = [dict(m) for m in self.config.get("milestones", [])]
+
+        tk.Label(win, text="节点列表（每个节点是一个时间段，如上午工作 09:00→12:30）",
+                 padx=10, pady=8).pack(anchor="w")
+
+        list_frame = tk.Frame(win)
+        list_frame.pack(fill="both", expand=True, padx=10)
+        cols = ("name", "start", "end")
+        tree = ttk.Treeview(list_frame, columns=cols, show="headings",
+                            height=8)
+        tree.heading("name", text="名称")
+        tree.heading("start", text="起始")
+        tree.heading("end", text="截止")
+        tree.column("name", width=160, anchor="w")
+        tree.column("start", width=80, anchor="center")
+        tree.column("end", width=80, anchor="center")
+        tree.pack(side="left", fill="both", expand=True)
+        vsb = ttk.Scrollbar(list_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+
+        def refresh_list():
+            for iid in tree.get_children():
+                tree.delete(iid)
+            for m in items:
+                tree.insert("", "end",
+                            values=(m.get("name", ""), m.get("start", ""), m.get("end", "")))
+
+        refresh_list()
+
+        # ---- edit fields ---- #
+        edit_frame = tk.LabelFrame(win, text="编辑", padx=10, pady=8)
+        edit_frame.pack(fill="x", padx=10, pady=8)
+        row = tk.Frame(edit_frame)
+        row.pack(fill="x")
+        tk.Label(row, text="名称", width=6).pack(side="left")
+        e_name = tk.Entry(row, width=14)
+        e_name.pack(side="left", padx=(0, 12))
+        tk.Label(row, text="起始 HH:MM", width=10).pack(side="left")
+        e_start = tk.Entry(row, width=8)
+        e_start.pack(side="left", padx=(0, 12))
+        tk.Label(row, text="截止 HH:MM", width=10).pack(side="left")
+        e_end = tk.Entry(row, width=8)
+        e_end.pack(side="left")
+
+        def on_select(_evt=None):
+            sel = tree.selection()
+            if not sel:
+                return
+            vals = tree.item(sel[0], "values")
+            e_name.delete(0, "end"); e_name.insert(0, vals[0])
+            e_start.delete(0, "end"); e_start.insert(0, vals[1])
+            e_end.delete(0, "end"); e_end.insert(0, vals[2])
+        tree.bind("<<TreeviewSelect>>", on_select)
+
+        def add_or_replace(replace_selected):
+            name = e_name.get().strip() or "节点"
+            start = e_start.get().strip()
+            end = e_end.get().strip()
+            s = _parse_hhmm(start)
+            e = _parse_hhmm(end)
+            if not s or not e:
+                messagebox.showerror("格式错误", "时间格式应为 HH:MM（如 09:00）",
+                                     parent=win)
+                return
+            if e <= s:
+                messagebox.showerror("区间错误", "截止时间必须晚于起始时间（不支持跨天）",
+                                     parent=win)
+                return
+            entry = {"name": name, "start": f"{s[0]:02d}:{s[1]:02d}",
+                     "end": f"{e[0]:02d}:{e[1]:02d}"}
+            if replace_selected:
+                sel = tree.selection()
+                if sel:
+                    idx = tree.index(sel[0])
+                    items[idx] = entry
+                else:
+                    items.append(entry)
+            else:
+                items.append(entry)
+            items.sort(key=lambda m: _parse_hhmm(m["start"]))
+            refresh_list()
+
+        btn_row = tk.Frame(edit_frame)
+        btn_row.pack(fill="x", pady=(8, 0))
+        tk.Button(btn_row, text="新增",
+                  command=lambda: add_or_replace(False)).pack(side="left")
+        tk.Button(btn_row, text="替换选中",
+                  command=lambda: add_or_replace(True)).pack(side="left", padx=6)
+        tk.Button(btn_row, text="删除选中",
+                  command=lambda: _delete_selected()).pack(side="left")
+
+        def _delete_selected():
+            sel = tree.selection()
+            if not sel:
+                return
+            idx = tree.index(sel[0])
+            if 0 <= idx < len(items):
+                items.pop(idx)
+                refresh_list()
+
+        # ---- save / cancel ---- #
+        bottom = tk.Frame(win)
+        bottom.pack(fill="x", padx=10, pady=10)
+
+        def do_save():
+            # final validation pass
+            cleaned = []
+            for m in items:
+                if _parse_hhmm(m.get("start")) and _parse_hhmm(m.get("end")):
+                    cleaned.append({"name": str(m.get("name", "节点")),
+                                    "start": m["start"], "end": m["end"]})
+            cleaned.sort(key=lambda m: _parse_hhmm(m["start"]))
+            self.config["milestones"] = cleaned
+            save_config(self.config)
+            self._render()
+            win.destroy()
+
+        tk.Button(bottom, text="保存", width=10, command=do_save).pack(side="right")
+        tk.Button(bottom, text="取消", width=10,
+                  command=win.destroy).pack(side="right", padx=8)
+        # restore default button
+        tk.Button(bottom, text="恢复默认", width=10,
+                  command=lambda: (_reset_default(), )).pack(side="left")
+
+        def _reset_default():
+            items.clear()
+            items.extend([dict(m) for m in DEFAULT_MILESTONES])
+            refresh_list()
+
     def _toggle_autostart(self):
         """Flip the boot-autostart Run-key entry and report the result."""
         now_on = not is_autostart_enabled()
@@ -1293,7 +1548,7 @@ class FloatingCapsule:
             return
         name = name.strip() or "目标"
         date_str = simpledialog.askstring(
-            "添加倒计时目标", "日期 (YYYY-MM-DD，如 2026-10-01)：",
+            "添加倒计时目标", "目标日期 (YYYY-MM-DD，如 2026-10-01)：",
             parent=self.root)
         if date_str is None:
             return
@@ -1302,7 +1557,27 @@ class FloatingCapsule:
             messagebox.showerror("格式错误", "日期格式应为 YYYY-MM-DD",
                                  parent=self.root)
             return
-        self.config["targets"].append({"name": name, "date": d.isoformat()})
+        # optional start date for progress tracking
+        start_str = simpledialog.askstring(
+            "添加倒计时目标",
+            "起始日期 (可留空，留空则无进度条)\n格式 YYYY-MM-DD，如 2026-01-01：",
+            parent=self.root,
+        )
+        entry = {"name": name, "date": d.isoformat()}
+        if start_str is not None:
+            start_str = start_str.strip()
+            if start_str:
+                sd = parse_date(start_str)
+                if sd is None:
+                    messagebox.showerror("格式错误", "起始日期格式应为 YYYY-MM-DD",
+                                         parent=self.root)
+                    return
+                if sd >= d:
+                    messagebox.showerror("区间错误", "起始日期必须早于目标日期",
+                                         parent=self.root)
+                    return
+                entry["start"] = sd.isoformat()
+        self.config["targets"].append(entry)
         save_config(self.config)
         self._render()
 

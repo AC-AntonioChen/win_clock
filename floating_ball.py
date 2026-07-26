@@ -652,10 +652,10 @@ def render_capsule(frame, scale=1.0, scroll_offset=0.0, theme=None):
     sep_w = _tw(pd, sep, f_hms)[0]
     hms_h = _tw(pd, "00", f_hms)[1]
 
-    pad = int(22 * s)
+    pad = int(24 * s)
     gap_unit = int(8 * s)
-    gap_hms_sep = int(8 * s)
-    group_gap = int(32 * s)
+    gap_hms_sep = int(5 * s)     # tighter spacing within H:M:S group
+    group_gap = int(40 * s)      # wider gap between big number and H:M:S
 
     days_group_w = d_w + (gap_unit + unit_w if unit_txt else 0)
     hms_group_w = sum(hms_pieces_w) + 2 * sep_w + 2 * gap_hms_sep

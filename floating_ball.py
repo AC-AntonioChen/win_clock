@@ -1320,16 +1320,25 @@ class FloatingCapsule:
         self._maybe_snap(x, y)
 
     def _maybe_snap(self, x, y):
+        # The window is larger than the visible capsule (MARGIN on each side
+        # holds the drop shadow). Snap based on the CAPSULE's actual edge, not
+        # the window edge — otherwise the shadow margin makes it snap when the
+        # capsule still looks ~24px away from the screen border.
         ww, wh = self._win_size()
+        capsule_left = x + MARGIN
+        capsule_top = y + MARGIN
+        capsule_right = x + ww - MARGIN
+        capsule_bottom = y + wh - MARGIN
         cands = []
-        if x < self.SNAP_DISTANCE:
-            cands.append(("left", x))
-        if self.screen_w - ww - x < self.SNAP_DISTANCE:
-            cands.append(("right", self.screen_w - ww - x))
-        if y < self.SNAP_DISTANCE:
-            cands.append(("top", y))
-        if self.screen_h - wh - y < self.SNAP_DISTANCE and y < self.screen_h - 80:
-            cands.append(("bottom", self.screen_h - wh - y))
+        if capsule_left < self.SNAP_DISTANCE:
+            cands.append(("left", capsule_left))
+        if self.screen_w - capsule_right < self.SNAP_DISTANCE:
+            cands.append(("right", self.screen_w - capsule_right))
+        if capsule_top < self.SNAP_DISTANCE:
+            cands.append(("top", capsule_top))
+        if (self.screen_h - capsule_bottom < self.SNAP_DISTANCE
+                and capsule_top < self.screen_h - 80):
+            cands.append(("bottom", self.screen_h - capsule_bottom))
         if cands:
             edge = min(cands, key=lambda c: c[1])[0]
             self._edge = edge

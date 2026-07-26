@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller 打包中间产物
+build/
+*.spec
+
+# 运行时生成的配置（含个人目标，可选保留）
+# 如想分享你的配置可注释掉下一行
+countdown_config.json
+
+# 调试/临时图片
+*_preview*.png
+diag_*.png
+
+# 压缩包（仓库里只放 exe 源文件，不放 7z）
+*.7z
+
+# IDE
+.vscode/
+.idea/
+.zcode/

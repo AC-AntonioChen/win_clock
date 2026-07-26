@@ -1,0 +1,8 @@
+# Windows 倒计时悬浮窗 - 运行依赖
+# 安装: pip install -r requirements.txt
+
+Pillow>=10.0.0      # 图像渲染 (PIL)
+pywin32>=306        # Windows 透明窗口 (UpdateLayeredWindow)
+numpy>=1.24.0       # 像素缓冲区处理
+
+# tkinter 随 Python 自带，无需单独安装

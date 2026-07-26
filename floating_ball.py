@@ -290,7 +290,7 @@ def _theme_from_bg(hex6, alpha=247):
     return Theme(
         bg=(r, g, b, alpha),
         bg_hi=(255, 255, 255, 16 if is_dark else 40),
-        outline=(255, 255, 255, 24 if is_dark else 60),
+        outline=(255, 255, 255, 0),  # no outline — avoids the cheap white edge
         shadow=(0, 0, 0, 120),
         name_col=name_c,
         label=sep_c,
@@ -306,7 +306,7 @@ THEMES = {
     # Night-ink: the original dark charcoal.
     "night": Theme(
         bg=(26, 27, 32, 247), bg_hi=(255, 255, 255, 16),
-        outline=(255, 255, 255, 24), shadow=(0, 0, 0, 120),
+        outline=(255, 255, 255, 0), shadow=(0, 0, 0, 120),
         name_col=(235, 238, 245, 255), label=(140, 144, 156, 255),
         accent=(255, 255, 255, 255), unit=(200, 204, 214, 255),
         hms=(228, 230, 238, 255), sep=(110, 114, 126, 255),
@@ -315,7 +315,7 @@ THEMES = {
     # Rose: warm dusty-pink.
     "rose": Theme(
         bg=(58, 32, 42, 247), bg_hi=(255, 255, 255, 18),
-        outline=(255, 200, 215, 40), shadow=(0, 0, 0, 120),
+        outline=(255, 200, 215, 0), shadow=(0, 0, 0, 120),
         name_col=(255, 226, 236, 255), label=(205, 168, 182, 255),
         accent=(255, 240, 245, 255), unit=(238, 200, 212, 255),
         hms=(245, 214, 224, 255), sep=(180, 140, 158, 255),
@@ -324,7 +324,7 @@ THEMES = {
     # Jade: deep teal-green.
     "jade": Theme(
         bg=(18, 44, 40, 247), bg_hi=(255, 255, 255, 18),
-        outline=(180, 240, 220, 36), shadow=(0, 0, 0, 120),
+        outline=(180, 240, 220, 0), shadow=(0, 0, 0, 120),
         name_col=(224, 246, 236, 255), label=(150, 196, 178, 255),
         accent=(236, 255, 246, 255), unit=(200, 232, 218, 255),
         hms=(220, 244, 232, 255), sep=(120, 168, 150, 255),

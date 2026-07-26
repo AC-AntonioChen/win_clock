@@ -607,7 +607,12 @@ def urgency_colour(progress):
 #  >0  = frame sliding in from below
 # --------------------------------------------------------------------------- #
 def render_capsule(frame, scale=1.0, scroll_offset=0.0, theme=None):
-    """Render a capsule frame to RGBA. Returns (image, capsule_width)."""
+    """Render a single capsule frame to RGBA. Returns (image, capsule_width).
+
+    The capsule BODY stays fixed; only the text content slides vertically by
+    `scroll_offset` (used during carousel transitions). For a static frame pass
+    scroll_offset=0.
+    """
     if theme is None:
         theme = THEMES[DEFAULT_THEME]
     s = scale
@@ -624,14 +629,13 @@ def render_capsule(frame, scale=1.0, scroll_offset=0.0, theme=None):
     main_txt = str(frame.main_text)
     unit_txt = frame.main_unit or ""
     hms = list(frame.hms) if frame.hms else ["00", "00", "00"]
-    # Urgency colour from the frame's progress. None (main target) -> white.
     num_color = urgency_colour(frame.progress)
 
     f_name = _font(18 * s, bold=True, cjk=_has_cjk(name_txt))
     f_label = _font(14 * s, bold=False, cjk=True)
     f_main = _font(58 * s, bold=True)
     f_unit = _font(20 * s, bold=False, cjk=_has_cjk(unit_txt))
-    f_hms = _font(28 * s, bold=True, mono=True)   # was 24 -> bigger per request
+    f_hms = _font(28 * s, bold=True, mono=True)
     f_tiny = _font(11 * s, bold=False, cjk=True)
 
     name_w, name_h, name_ox = _tw(pd, name_txt, f_name)
@@ -646,7 +650,7 @@ def render_capsule(frame, scale=1.0, scroll_offset=0.0, theme=None):
     pad = int(22 * s)
     gap_unit = int(8 * s)
     gap_hms_sep = int(8 * s)
-    group_gap = int(32 * s)   # gap between big number and H:M:S group
+    group_gap = int(32 * s)
 
     days_group_w = d_w + (gap_unit + unit_w if unit_txt else 0)
     hms_group_w = sum(hms_pieces_w) + 2 * sep_w + 2 * gap_hms_sep
@@ -655,41 +659,30 @@ def render_capsule(frame, scale=1.0, scroll_offset=0.0, theme=None):
         W = content_w
         win_w = W + MARGIN * 2
 
-    img = Image.new("RGBA", (win_w, win_h), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-
-    # scroll_offset moves the WHOLE capsule (body + text + bar) up/down as a
-    # unit. The body_mask clip at the end still bounds it, but during a slide
-    # the outgoing and incoming capsules occupy different vertical positions,
-    # so alpha-compositing them no longer double-stacks two bodies on top of
-    # each other (which was causing the muddy/blue overlap).
-    dy_total = int(scroll_offset * (H + 8))
-    x0, y0 = MARGIN, MARGIN + dy_total
-    x1, y1 = MARGIN + W, MARGIN + H + dy_total
+    # capsule body geometry is FIXED (does not move with scroll_offset)
+    x0, y0 = MARGIN, MARGIN
+    x1, y1 = MARGIN + W, MARGIN + H
     radius = H // 2
 
-    # soft drop shadow (skip for fully-transparent themes)
+    # ---- draw body (shadow + fill + sheen + outline) on its own layer ---- #
+    body_layer = Image.new("RGBA", (win_w, win_h), (0, 0, 0, 0))
+    bdraw = ImageDraw.Draw(body_layer)
     if theme.shadow[3] > 0:
         shadow = Image.new("RGBA", (win_w, win_h), (0, 0, 0, 0))
         sd = ImageDraw.Draw(shadow)
         sd.rounded_rectangle((x0 + 1, y0 + 6, x1 + 3, y1 + 8),
                              radius=radius, fill=theme.shadow)
         shadow = shadow.filter(ImageFilter.GaussianBlur(8 * s))
-        img = Image.alpha_composite(img, shadow)
-        draw = ImageDraw.Draw(img)
+        body_layer = Image.alpha_composite(body_layer, shadow)
+        bdraw = ImageDraw.Draw(body_layer)
 
-    # body fill (skip drawing if fully transparent — text floats on desktop)
     has_body = theme.bg[3] > 0
     body_mask = None
     if has_body:
-        draw.rounded_rectangle((x0, y0, x1, y1), radius=radius, fill=theme.bg)
-
-        # body mask (rounded) reused for sheen clip + final text clip
+        bdraw.rounded_rectangle((x0, y0, x1, y1), radius=radius, fill=theme.bg)
         body_mask = Image.new("L", (win_w, win_h), 0)
         ImageDraw.Draw(body_mask).rounded_rectangle((x0, y0, x1 - 1, y1 - 1),
                                                     radius=radius, fill=255)
-
-        # top sheen (alpha-composited, clipped to body — no fringe)
         if theme.bg_hi[3] > 0:
             sheen = Image.new("RGBA", (win_w, win_h), (0, 0, 0, 0))
             shd = ImageDraw.Draw(sheen)
@@ -702,23 +695,54 @@ def render_capsule(frame, scale=1.0, scroll_offset=0.0, theme=None):
                 shd.line((x0, y0 + i, x1 - 1, y0 + i), fill=(255, 255, 255, a))
             sheen.putalpha(Image.composite(sheen.split()[3],
                                            Image.new("L", (win_w, win_h), 0), body_mask))
-            img = Image.alpha_composite(img, sheen)
-            draw = ImageDraw.Draw(img)
-
-        # crisp outline
+            body_layer = Image.alpha_composite(body_layer, sheen)
+            bdraw = ImageDraw.Draw(body_layer)
         if theme.outline[3] > 0:
-            draw.rounded_rectangle((x0, y0, x1 - 1, y1 - 1),
-                                   radius=radius, outline=theme.outline, width=1)
+            bdraw.rounded_rectangle((x0, y0, x1 - 1, y1 - 1),
+                                    radius=radius, outline=theme.outline, width=1)
 
-    # ---- text (the whole capsule already shifted by dy_total above) ---- #
+    # ---- draw content (text + bar) on its own layer, then slide it ---- #
+    content_layer = _draw_content(
+        frame, win_w, win_h, x0, y0, x1, y1, pad, group_gap, gap_unit, gap_hms_sep,
+        name_txt, label_txt, main_txt, unit_txt, hms, num_color,
+        f_name, f_label, f_main, f_unit, f_hms, f_tiny,
+        name_w, name_h, name_ox, label_w, d_w, d_h, d_ox,
+        unit_w, unit_h, unit_ox, hms_pieces_w, sep, sep_w, hms_h,
+        has_body, theme, s,
+    )
+    # apply vertical slide to content only
+    if scroll_offset != 0.0:
+        dy = int(scroll_offset * (H + 8))
+        shifted = Image.new("RGBA", (win_w, win_h), (0, 0, 0, 0))
+        shifted.paste(content_layer, (0, dy), content_layer)
+        content_layer = shifted
+
+    # clip content to body shape (so sliding text doesn't leak past the pill)
+    if body_mask is not None:
+        clipped = Image.new("RGBA", (win_w, win_h), (0, 0, 0, 0))
+        clipped.paste(content_layer, (0, 0), body_mask)
+        content_layer = clipped
+
+    # final: body underneath, content on top
+    img = Image.alpha_composite(body_layer, content_layer)
+    return img, W
+
+
+def _draw_content(frame, win_w, win_h, x0, y0, x1, y1, pad, group_gap,
+                  gap_unit, gap_hms_sep, name_txt, label_txt, main_txt, unit_txt,
+                  hms, num_color, f_name, f_label, f_main, f_unit, f_hms, f_tiny,
+                  name_w, name_h, name_ox, label_w, d_w, d_h, d_ox,
+                  unit_w, unit_h, unit_ox, hms_pieces_w, sep, sep_w, hms_h,
+                  has_body, theme, s):
+    """Draw the text + progress bar onto a transparent layer. Pure content —
+    no capsule body. Split out so the slide animation can move content only."""
+    layer = Image.new("RGBA", (win_w, win_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
     mid_y = (y0 + y1) // 2
-    # Left column: name above label, vertically centred as a block.
-    # We space the two lines by a value derived from the font SIZE (not the
-    # textbbox height), because CJK font bounding boxes under-report vertical
-    # extent and the two lines visibly overlap if we trust bbox height alone.
+
     line_gap = int(10 * s)
-    line_step_name = int(20 * s)    # visual row height of the 18px name font
-    line_step_label = int(16 * s)   # visual row height of the 14px label font
+    line_step_name = int(20 * s)
+    line_step_label = int(16 * s)
     block_h = line_step_name + line_gap + line_step_label
     block_top = mid_y - block_h // 2
     left_x = x0 + pad
@@ -754,32 +778,118 @@ def render_capsule(frame, scale=1.0, scroll_offset=0.0, theme=None):
         tw, th, tox = _tw(draw, txt, f_tiny)
         draw.text((ccx - tw // 2 - tox, label_y), txt, fill=theme.hms_label, font=f_tiny)
 
-    # ---- bottom progress bar (only for milestone frames with progress) ---- #
+    # progress bar
     if frame.progress is not None and has_body:
         bar_h = max(2, int(4 * s))
         bar_inset = max(2, int(4 * s))
         bar_y = y1 - bar_h - bar_inset
         bar_x0 = x0 + bar_inset
         bar_x1 = x1 - bar_inset
-        # trough (dark groove)
         draw.rounded_rectangle((bar_x0, bar_y, bar_x1, bar_y + bar_h),
-                               radius=bar_h // 2,
-                               fill=(0, 0, 0, 90))
-        # fill (urgency-coloured), width = progress * trough width
+                               radius=bar_h // 2, fill=(0, 0, 0, 90))
         fill_w = int((bar_x1 - bar_x0) * max(0.0, min(1.0, frame.progress)))
         if fill_w > 1:
             draw.rounded_rectangle(
                 (bar_x0, bar_y, bar_x0 + fill_w, bar_y + bar_h),
                 radius=bar_h // 2, fill=num_color,
             )
+    return layer
 
-    # clip text to the rounded body so scrolling frames don't leak past edges.
-    # For bodyless (clear) themes there's no shape to clip to, so return as-is.
-    if body_mask is None:
-        return img, W
-    out = Image.new("RGBA", (win_w, win_h), (0, 0, 0, 0))
-    out.paste(img, (0, 0), body_mask)
-    return out, W
+
+def render_scroll_transition(frame_out, frame_in, progress, scale=1.0, theme=None):
+    """Render a slide transition between two frames on ONE fixed capsule body.
+
+    The body is drawn once (from frame_in's width, which is the destination).
+    The outgoing content slides up (-progress) and incoming content slides in
+    from below (1-progress), both clipped to the body. Because only content
+    moves and there's a single body, there is no double-stacked-body colour
+    bleed.
+    """
+    if theme is None:
+        theme = THEMES[DEFAULT_THEME]
+    s = scale
+    # size the canvas from the incoming frame (destination), but also ensure it
+    # fits the outgoing frame so neither is cropped.
+    img_in, W = render_capsule(frame_in, scale=s, scroll_offset=0.0, theme=theme)
+    img_out, W_out = render_capsule(frame_out, scale=s, scroll_offset=0.0, theme=theme)
+    win_w = max(img_in.size[0], img_out.size[0])
+    win_h = max(img_in.size[1], img_out.size[1])
+    H = int(round(BASE_H * s))
+    x0, y0 = MARGIN, MARGIN
+    x1 = MARGIN + max(W, W_out)
+    y1 = MARGIN + H
+    radius = H // 2
+
+    # redraw a clean body sized to win_w (union), once
+    body_layer = Image.new("RGBA", (win_w, win_h), (0, 0, 0, 0))
+    bdraw = ImageDraw.Draw(body_layer)
+    if theme.shadow[3] > 0:
+        shadow = Image.new("RGBA", (win_w, win_h), (0, 0, 0, 0))
+        sd = ImageDraw.Draw(shadow)
+        sd.rounded_rectangle((x0 + 1, y0 + 6, x1 + 3, y1 + 8),
+                             radius=radius, fill=theme.shadow)
+        shadow = shadow.filter(ImageFilter.GaussianBlur(8 * s))
+        body_layer = Image.alpha_composite(body_layer, shadow)
+        bdraw = ImageDraw.Draw(body_layer)
+    has_body = theme.bg[3] > 0
+    body_mask = None
+    if has_body:
+        bdraw.rounded_rectangle((x0, y0, x1, y1), radius=radius, fill=theme.bg)
+        body_mask = Image.new("L", (win_w, win_h), 0)
+        ImageDraw.Draw(body_mask).rounded_rectangle((x0, y0, x1 - 1, y1 - 1),
+                                                    radius=radius, fill=255)
+        if theme.bg_hi[3] > 0:
+            sheen = Image.new("RGBA", (win_w, win_h), (0, 0, 0, 0))
+            shd = ImageDraw.Draw(sheen)
+            sheen_h = max(1, int(H * 0.42))
+            for i in range(sheen_h):
+                t = i / sheen_h
+                a = int(theme.bg_hi[3] * (1 - t) ** 1.5)
+                if a <= 0:
+                    break
+                shd.line((x0, y0 + i, x1 - 1, y0 + i), fill=(255, 255, 255, a))
+            sheen.putalpha(Image.composite(sheen.split()[3],
+                                           Image.new("L", (win_w, win_h), 0), body_mask))
+            body_layer = Image.alpha_composite(body_layer, sheen)
+            bdraw = ImageDraw.Draw(body_layer)
+        if theme.outline[3] > 0:
+            bdraw.rounded_rectangle((x0, y0, x1 - 1, y1 - 1),
+                                    radius=radius, outline=theme.outline, width=1)
+
+    # Render content-only for each frame by using a bodyless theme copy
+    # (shadow/bg/sheen/outline all alpha=0), so only text + progress bar remain.
+    content_theme = Theme(
+        bg=(0, 0, 0, 0), bg_hi=(0, 0, 0, 0), outline=(0, 0, 0, 0), shadow=(0, 0, 0, 0),
+        name_col=theme.name_col, label=theme.label, accent=theme.accent,
+        unit=theme.unit, hms=theme.hms, sep=theme.sep, hms_label=theme.hms_label,
+    )
+    cont_out, _ = render_capsule(frame_out, scale=s, scroll_offset=0.0, theme=content_theme)
+    cont_in, _ = render_capsule(frame_in, scale=s, scroll_offset=0.0, theme=content_theme)
+    # pad content to union size
+    cont_out_p = Image.new("RGBA", (win_w, win_h), (0, 0, 0, 0))
+    cont_in_p = Image.new("RGBA", (win_w, win_h), (0, 0, 0, 0))
+    cont_out_p.paste(cont_out, (0, 0), cont_out)
+    cont_in_p.paste(cont_in, (0, 0), cont_in)
+
+    # slide: outgoing up by progress, incoming from below
+    dy = int((H + 8))
+    out_shifted = Image.new("RGBA", (win_w, win_h), (0, 0, 0, 0))
+    in_shifted = Image.new("RGBA", (win_w, win_h), (0, 0, 0, 0))
+    out_shifted.paste(cont_out_p, (0, -int(progress * dy)), cont_out_p)
+    in_shifted.paste(cont_in_p, (0, int((1 - progress) * dy)), cont_in_p)
+
+    # clip both to body
+    if body_mask is not None:
+        cl_out = Image.new("RGBA", (win_w, win_h), (0, 0, 0, 0))
+        cl_in = Image.new("RGBA", (win_w, win_h), (0, 0, 0, 0))
+        cl_out.paste(out_shifted, (0, 0), body_mask)
+        cl_in.paste(in_shifted, (0, 0), body_mask)
+        out_shifted, in_shifted = cl_out, cl_in
+
+    # composite: body, then outgoing content, then incoming content
+    img = Image.alpha_composite(body_layer, out_shifted)
+    img = Image.alpha_composite(img, in_shifted)
+    return img, max(W, W_out)
 
 
 # --------------------------------------------------------------------------- #
@@ -1110,21 +1220,14 @@ class FloatingCapsule:
             p = self._scroll_progress()
             # ease-in-out (smooth start AND end) for a gentle slide
             eased = 0.5 - 0.5 * math.cos(p * math.pi)
-            # outgoing slides UP (offset 0 -> -1), incoming slides in from BELOW (offset +1 -> 0)
-            img_out, _ = render_capsule(frames[out_idx], scale=self.scale,
-                                        scroll_offset=-eased, theme=theme)
-            img_in, W = render_capsule(frames[in_idx], scale=self.scale,
-                                       scroll_offset=1 - eased, theme=theme)
-            # The two frames may have different widths (content auto-grows the
-            # capsule). Pad both onto a common transparent canvas of the larger
-            # size so alpha_composite won't raise "images do not match".
-            max_w = max(img_out.size[0], img_in.size[0])
-            max_h = max(img_out.size[1], img_in.size[1])
-            canvas_out = Image.new("RGBA", (max_w, max_h), (0, 0, 0, 0))
-            canvas_in = Image.new("RGBA", (max_w, max_h), (0, 0, 0, 0))
-            canvas_out.paste(img_out, (0, 0), img_out)
-            canvas_in.paste(img_in, (0, 0), img_in)
-            img = Image.alpha_composite(canvas_out, canvas_in)
+            # ONE fixed capsule body + two sliding content layers (outgoing up,
+            # incoming from below). This avoids double-stacking two capsule
+            # bodies (which caused the muddy/blue overlap) and the size-mismatch
+            # crash (render_scroll_transition unions the widths internally).
+            img, W = render_scroll_transition(
+                frames[out_idx], frames[in_idx], eased,
+                scale=self.scale, theme=theme,
+            )
         else:
             frame = self._current_frame()
             # refresh the live numbers on this same item

@@ -778,21 +778,21 @@ def _draw_content(frame, win_w, win_h, x0, y0, x1, y1, pad, group_gap,
         tw, th, tox = _tw(draw, txt, f_tiny)
         draw.text((ccx - tw // 2 - tox, label_y), txt, fill=theme.hms_label, font=f_tiny)
 
-    # progress bar
+    # progress bar — a solid strip hugging the very bottom edge of the capsule,
+    # edge-to-edge (no inset, no rounded groove). Reads like a battery/charge
+    # indicator: cheap-looking floating bars come from insets + rounded troughs.
     if frame.progress is not None and has_body:
-        bar_h = max(2, int(4 * s))
-        bar_inset = max(2, int(4 * s))
-        bar_y = y1 - bar_h - bar_inset
-        bar_x0 = x0 + bar_inset
-        bar_x1 = x1 - bar_inset
-        draw.rounded_rectangle((bar_x0, bar_y, bar_x1, bar_y + bar_h),
-                               radius=bar_h // 2, fill=(0, 0, 0, 90))
+        bar_h = max(3, int(5 * s))
+        bar_y = y1 - bar_h          # flush against the bottom edge
+        bar_x0 = x0                 # edge-to-edge (body clip rounds the corners)
+        bar_x1 = x1
         fill_w = int((bar_x1 - bar_x0) * max(0.0, min(1.0, frame.progress)))
+        # subtle dark track so unfilled portion is just-visible against the body
+        draw.rectangle((bar_x0, bar_y, bar_x1, bar_y + bar_h),
+                       fill=(0, 0, 0, 70))
         if fill_w > 1:
-            draw.rounded_rectangle(
-                (bar_x0, bar_y, bar_x0 + fill_w, bar_y + bar_h),
-                radius=bar_h // 2, fill=num_color,
-            )
+            draw.rectangle((bar_x0, bar_y, bar_x0 + fill_w, bar_y + bar_h),
+                           fill=num_color)
     return layer
 
 
